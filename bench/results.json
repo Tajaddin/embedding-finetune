@@ -1,0 +1,19 @@
+{
+  "k": 5,
+  "n_train": 800,
+  "n_eval_queries": 200,
+  "n_eval_documents": 58,
+  "baseline_recall": 0.26,
+  "projected_recall": 0.28,
+  "lift_absolute": 0.02,
+  "head_params": 197248,
+  "training_elapsed_secs": 1.29,
+  "loss_history": [
+    0.0105,
+    0.0002,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ]
+}
