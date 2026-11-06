@@ -12,6 +12,7 @@ import torch
 from embedding_finetune import (
     ProjectionHead,
     Triplet,
+    hits_at_k,
     load_head,
     recall_at_k,
     save_head,
@@ -89,6 +90,15 @@ def test_recall_at_k_random_is_low() -> None:
     r = recall_at_k(queries, docs, gold, k=5)
     # Random retrieval finds doc 0 about k/100 of the time.
     assert r < 0.2
+
+
+def test_hits_at_k_marks_each_query() -> None:
+    docs = np.eye(8, dtype=np.float32)
+    queries = docs[[0, 1, 2]]
+    gold = np.array([0, 5, 2])
+    hits = hits_at_k(queries, docs, gold, k=1)
+    assert hits.tolist() == [True, False, True]
+    assert recall_at_k(queries, docs, gold, k=1) == pytest.approx(2 / 3)
 
 
 def test_synthetic_triplets_split() -> None:

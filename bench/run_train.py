@@ -1,11 +1,15 @@
-"""End-to-end benchmark:
+"""End-to-end benchmark, k-fold cross-validated over (question, answer) pairs:
 
-1. Build synthetic topical triplets (cooking / sports / technology)
-2. Embed them once with fastembed BGE-small (CPU)
-3. Train a projection head with triplet loss (~30s on CPU)
-4. Evaluate recall@5 on a held-out (anchor → correct doc) eval
+1. Split the 60 synthetic pairs (cooking / sports / technology) into folds
+2. For each fold, train a projection head on the other folds' triplets
+   (fastembed BGE-small embeddings, CPU)
+3. Retrieve each held-out question's own answer from the full 60-answer
+   corpus, with and without the head, and record recall@k hits
+4. Pool the held-out queries across folds and report recall@k with a paired
+   bootstrap 95% confidence interval on the lift
 
-Compares frozen-BGE recall vs BGE + projection-head recall.
+Every question is evaluated exactly once, by a head that never saw it or its
+answer.
 """
 
 from __future__ import annotations
@@ -17,18 +21,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from embedding_finetune import (
-    ProjectionHead,
-    Triplet,
-    recall_at_k,
-    save_head,
-    synthetic_triplets,
-    train_projection_head,
-)
+import numpy as np
+
+from embedding_finetune import hits_at_k, synthetic_triplets, train_projection_head
 from embedding_finetune.train import apply_head
 
 BENCH = Path(__file__).resolve().parent
-HEAD_OUT = BENCH / "head.pt"
 RESULTS_OUT = BENCH / "results.json"
 
 
@@ -38,7 +36,6 @@ def _fastembed_callable():
         from fastembed import TextEmbedding
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("fastembed required") from exc
-    import numpy as np
 
     model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
@@ -48,24 +45,20 @@ def _fastembed_callable():
     return _embed
 
 
-def build_eval_set(eval_triplets: list[Triplet]) -> tuple[list[str], list[str], list[int]]:
-    """Construct (queries, documents, gold_indices) for recall@k eval.
+def _bootstrap_ci(
+    baseline: np.ndarray, projected: np.ndarray, *, resamples: int, seed: int
+) -> dict[str, list[float]]:
+    """Percentile 95% CIs from resampling queries with replacement, paired so
+    the baseline and head are always scored on the same resample."""
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(baseline), size=(resamples, len(baseline)))
+    b = baseline[idx].mean(axis=1)
+    p = projected[idx].mean(axis=1)
 
-    Documents = unique positives across the eval split.
-    Each query = an anchor; gold = the document index matching its positive.
-    Negatives are not used at eval time but help training quality earlier.
-    """
-    docs: list[str] = []
-    doc_idx_of: dict[str, int] = {}
-    queries: list[str] = []
-    gold: list[int] = []
-    for t in eval_triplets:
-        if t.positive not in doc_idx_of:
-            doc_idx_of[t.positive] = len(docs)
-            docs.append(t.positive)
-        queries.append(t.anchor)
-        gold.append(doc_idx_of[t.positive])
-    return queries, docs, gold
+    def ci(x: np.ndarray) -> list[float]:
+        return [round(float(v), 4) for v in np.percentile(x, [2.5, 97.5])]
+
+    return {"baseline": ci(b), "projected": ci(p), "lift": ci(p - b)}
 
 
 def main() -> int:
@@ -74,64 +67,86 @@ def main() -> int:
     except Exception:
         pass
     p = argparse.ArgumentParser()
-    p.add_argument("--n-train", type=int, default=800)
-    p.add_argument("--n-eval", type=int, default=200)
+    p.add_argument("--folds", type=int, default=4)
+    p.add_argument("--seed", type=int, default=7)
     p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--margin", type=float, default=0.2)
     p.add_argument("--k", type=int, default=5)
+    p.add_argument("--bootstrap", type=int, default=10_000)
     args = p.parse_args()
 
     print("Loading embedder (fastembed BGE-small)...")
     embedder = _fastembed_callable()
 
-    train_triplets, eval_triplets = synthetic_triplets(n_train=args.n_train, n_eval=args.n_eval)
-    print(f"Train triplets: {len(train_triplets)} | Eval triplets: {len(eval_triplets)}")
+    baseline_hits: list[np.ndarray] = []
+    projected_hits: list[np.ndarray] = []
+    per_fold: list[dict] = []
+    for fold in range(args.folds):
+        train_triplets, eval_triplets = synthetic_triplets(
+            n_folds=args.folds, fold=fold, seed=args.seed
+        )
+        corpus = sorted({t.positive for t in train_triplets + eval_triplets})
+        queries = [t.anchor for t in eval_triplets]
+        gold = np.array([corpus.index(t.positive) for t in eval_triplets], dtype=np.int64)
 
-    queries, documents, gold_idx = build_eval_set(eval_triplets)
-    print(f"Eval: {len(queries)} queries against {len(documents)} unique documents")
+        q_raw = embedder(queries).astype(np.float32)
+        d_raw = embedder(corpus).astype(np.float32)
+        base = hits_at_k(q_raw, d_raw, gold, k=args.k)
 
-    # Eval BEFORE training (raw BGE).
-    import numpy as np
+        head, stats = train_projection_head(
+            train_triplets, embedder,
+            hidden=args.hidden, epochs=args.epochs, lr=args.lr, margin=args.margin,
+            seed=args.seed,
+        )
+        proj = hits_at_k(apply_head(head, q_raw), apply_head(head, d_raw), gold, k=args.k)
 
-    q_raw = embedder(queries).astype(np.float32)
-    d_raw = embedder(documents).astype(np.float32)
-    gold = np.array(gold_idx, dtype=np.int64)
-    baseline_recall = recall_at_k(q_raw, d_raw, gold, k=args.k)
-    print(f"Baseline recall@{args.k} (raw BGE-small): {baseline_recall:.4f}")
+        baseline_hits.append(base)
+        projected_hits.append(proj)
+        per_fold.append({
+            "fold": fold,
+            "n_train_triplets": len(train_triplets),
+            "n_eval_queries": len(queries),
+            "baseline_recall": round(float(base.mean()), 4),
+            "projected_recall": round(float(proj.mean()), 4),
+            "training_elapsed_secs": stats.elapsed_secs,
+            "loss_history": stats.loss_history,
+        })
+        print(
+            f"fold {fold}: {len(train_triplets)} train triplets, {len(queries)} held-out queries | "
+            f"recall@{args.k} {base.mean():.4f} -> {proj.mean():.4f}"
+        )
 
-    # Train.
-    head, stats = train_projection_head(
-        train_triplets, embedder,
-        hidden=args.hidden, epochs=args.epochs, lr=args.lr, margin=args.margin,
-        log_every=1,
-    )
-    print(f"Trained head: {head.count_params():,} params in {stats.elapsed_secs:.2f}s")
-
-    # Eval AFTER training (projected vectors).
-    q_proj = apply_head(head, q_raw)
-    d_proj = apply_head(head, d_raw)
-    projected_recall = recall_at_k(q_proj, d_proj, gold, k=args.k)
-    print(f"Projected recall@{args.k} (BGE + head):    {projected_recall:.4f}")
+    base = np.concatenate(baseline_hits)
+    proj = np.concatenate(projected_hits)
+    ci = _bootstrap_ci(base, proj, resamples=args.bootstrap, seed=args.seed)
+    baseline_recall = float(base.mean())
+    projected_recall = float(proj.mean())
     lift = projected_recall - baseline_recall
-    print(f"\nLift: {lift:+.4f} absolute ({lift*100:+.1f} percentage points)")
 
-    save_head(head, HEAD_OUT)
-    print(f"\nSaved head to {HEAD_OUT}")
+    print(f"\nHeld-out queries: {len(base)} against {len(corpus)} documents, {args.folds} folds")
+    print(f"Baseline recall@{args.k} (raw BGE-small): {baseline_recall:.4f}  95% CI {ci['baseline']}")
+    print(f"Projected recall@{args.k} (BGE + head):    {projected_recall:.4f}  95% CI {ci['projected']}")
+    print(f"Lift: {lift:+.4f} absolute, 95% CI {ci['lift']}")
+    print(f"Queries the head fixed: {int((proj & ~base).sum())}, broke: {int((base & ~proj).sum())}")
 
     RESULTS_OUT.write_text(
         json.dumps({
             "k": args.k,
-            "n_train": len(train_triplets),
-            "n_eval_queries": len(queries),
-            "n_eval_documents": len(documents),
+            "folds": args.folds,
+            "seed": args.seed,
+            "n_eval_queries": int(len(base)),
+            "n_documents": len(corpus),
             "baseline_recall": round(baseline_recall, 4),
             "projected_recall": round(projected_recall, 4),
             "lift_absolute": round(lift, 4),
+            "ci95": ci,
+            "bootstrap_resamples": args.bootstrap,
+            "queries_fixed_by_head": int((proj & ~base).sum()),
+            "queries_broken_by_head": int((base & ~proj).sum()),
             "head_params": head.count_params(),
-            "training_elapsed_secs": stats.elapsed_secs,
-            "loss_history": stats.loss_history,
+            "per_fold": per_fold,
         }, indent=2),
         encoding="utf-8",
     )

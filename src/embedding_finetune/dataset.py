@@ -6,9 +6,8 @@ unrelated text. Training maximizes anchor–positive similarity over
 anchor–negative similarity (the classic triplet-loss objective).
 
 This module ships one synthetic generator that produces clean topical
-triplets across cooking / sports / technology — enough to demonstrate
-measurable recall lift in <1 minute of CPU training. Bring your own
-``Triplet`` list for real domains.
+triplets across cooking / sports / technology, small enough to train on
+CPU. Bring your own ``Triplet`` list for real domains.
 """
 
 from __future__ import annotations

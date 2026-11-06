@@ -8,6 +8,14 @@ import numpy as np
 def recall_at_k(query_vecs: np.ndarray, doc_vecs: np.ndarray, gold_indices: np.ndarray, k: int = 5) -> float:
     """For each row of ``query_vecs``, find top-k cosine neighbors in ``doc_vecs``
     and check whether ``gold_indices[i]`` is in that top-k. Mean across queries."""
+    hits = hits_at_k(query_vecs, doc_vecs, gold_indices, k=k)
+    return float(hits.sum()) / max(len(hits), 1)
+
+
+def hits_at_k(query_vecs: np.ndarray, doc_vecs: np.ndarray, gold_indices: np.ndarray, k: int = 5) -> np.ndarray:
+    """Per-query version of :func:`recall_at_k`: a bool array, True where the
+    gold document is in the query's top-k. Use it for paired comparisons and
+    bootstrap confidence intervals."""
     if query_vecs.dtype != np.float32:
         query_vecs = query_vecs.astype(np.float32)
     if doc_vecs.dtype != np.float32:
@@ -18,13 +26,11 @@ def recall_at_k(query_vecs: np.ndarray, doc_vecs: np.ndarray, gold_indices: np.n
     q = query_vecs / q_norms
     d = doc_vecs / d_norms
     scores = q @ d.T
-    n_queries = scores.shape[0]
-    hits = 0
-    for i in range(n_queries):
+    hits = np.zeros(scores.shape[0], dtype=bool)
+    for i in range(scores.shape[0]):
         top = np.argpartition(-scores[i], k)[:k]
-        if int(gold_indices[i]) in top.tolist():
-            hits += 1
-    return hits / max(n_queries, 1)
+        hits[i] = int(gold_indices[i]) in top.tolist()
+    return hits
 
 
 def retrieval_eval(
