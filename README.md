@@ -81,8 +81,9 @@ import numpy as np
 model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 embed = lambda texts: np.stack(list(model.embed(list(texts))))
 
-# Build triplets (anchor, positive, negative).
-train, _ = synthetic_triplets(n_train=800, n_eval=200)
+# Build triplets (anchor, positive, negative). Fold 0 of 4: 675 training
+# triplets and 15 held-out questions. n_train / n_eval only cap these counts.
+train, held_out = synthetic_triplets(fold=0)
 
 # Train the projection head.
 head, stats = train_projection_head(train, embed, hidden=256, epochs=6)
@@ -115,11 +116,11 @@ train = [
     Triplet(anchor="acetaminophen overdose symptoms",
             positive="Acetaminophen overdose causes liver damage, nausea, and abdominal pain.",
             negative="Ibuprofen is an NSAID used for inflammation and pain."),
-    # ... at least 500 triplets for measurable lift
+    # ... (this repo does not measure how many triplets a lift needs)
 ]
 ```
 
-Mining negatives: random from a different cluster is the cheap baseline. Hard-negative mining (nearest neighbor in raw embedding space that isn't the gold positive) yields stronger lift but adds complexity — out of scope for v0.1.
+Mining negatives: random from a different cluster is the cheap baseline. Hard-negative mining (nearest neighbor in raw embedding space that isn't the gold positive) may help, but it is not measured here and adds complexity — out of scope for v0.1.
 
 ## Tests
 
@@ -164,7 +165,7 @@ Coverage:
 
 **Training cached embeddings only.** The trainer embeds every unique text once and reuses those vectors across epochs. This is the whole reason CPU training is feasible. If your dataset doesn't fit in RAM as float32 vectors, you'll need an in-loop embedder + a bigger refactor.
 
-**No hard-negative mining.** Random-topic negatives are the cheapest signal. Hard negatives (highest-similarity wrong answer) increase lift meaningfully but require either a multi-stage training loop or an online mining step. Out of scope for v0.1.
+**No hard-negative mining.** Random-topic negatives are the cheapest signal. Hard negatives (highest-similarity wrong answer) may help but are untested here, and they require either a multi-stage training loop or an online mining step. Out of scope for v0.1.
 
 **Frozen embedder assumption.** This recipe deliberately doesn't fine-tune the embedder. For tasks where the embedder's vocabulary is missing key domain terms (rare languages, niche jargon), full fine-tuning will beat projection-head fine-tuning. The projection head is the right *first* thing to try, not the last.
 
