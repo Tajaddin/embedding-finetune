@@ -12,11 +12,13 @@ import torch
 from embedding_finetune import (
     ProjectionHead,
     Triplet,
+    hits_at_k,
     load_head,
     recall_at_k,
     save_head,
     synthetic_triplets,
 )
+from embedding_finetune.dataset import _TOPICS
 from embedding_finetune.train import apply_head, train_projection_head
 
 
@@ -90,11 +92,55 @@ def test_recall_at_k_random_is_low() -> None:
     assert r < 0.2
 
 
+def test_hits_at_k_marks_each_query() -> None:
+    docs = np.eye(8, dtype=np.float32)
+    queries = docs[[0, 1, 2]]
+    gold = np.array([0, 5, 2])
+    hits = hits_at_k(queries, docs, gold, k=1)
+    assert hits.tolist() == [True, False, True]
+    assert recall_at_k(queries, docs, gold, k=1) == pytest.approx(2 / 3)
+
+
 def test_synthetic_triplets_split() -> None:
     train, ev = synthetic_triplets(n_train=20, n_eval=10, seed=1)
     assert len(train) == 20
     assert len(ev) == 10
     assert all(isinstance(t, Triplet) for t in train + ev)
+
+
+def _texts(triplets: list[Triplet]) -> set[str]:
+    return {s for t in triplets for s in (t.anchor, t.positive, t.negative)}
+
+
+def test_eval_pairs_share_no_text_with_training() -> None:
+    train, ev = synthetic_triplets()
+    assert ev
+    assert _texts(train).isdisjoint(_texts(ev))
+
+
+def test_eval_gold_is_the_questions_own_answer() -> None:
+    own_answer = {q: a for pairs in _TOPICS.values() for q, a in pairs}
+    _, ev = synthetic_triplets()
+    assert [t.positive for t in ev] == [own_answer[t.anchor] for t in ev]
+
+
+def test_folds_hold_out_every_pair_exactly_once() -> None:
+    n_folds = 4
+    held_out = [
+        [t.anchor for t in synthetic_triplets(n_folds=n_folds, fold=f)[1]] for f in range(n_folds)
+    ]
+    flat = [q for fold in held_out for q in fold]
+    all_questions = {q for pairs in _TOPICS.values() for q, _ in pairs}
+    assert len(flat) == len(all_questions)
+    assert set(flat) == all_questions
+    for fold in held_out:  # stratified: every topic is held out in every fold
+        topics = {t for t, pairs in _TOPICS.items() for q, _ in pairs if q in fold}
+        assert topics == set(_TOPICS)
+
+
+def test_fold_out_of_range_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        synthetic_triplets(n_folds=4, fold=4)
 
 
 def test_synthetic_triplets_anchor_positive_same_topic() -> None:

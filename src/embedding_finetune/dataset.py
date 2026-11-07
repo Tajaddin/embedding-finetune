@@ -6,9 +6,8 @@ unrelated text. Training maximizes anchor–positive similarity over
 anchor–negative similarity (the classic triplet-loss objective).
 
 This module ships one synthetic generator that produces clean topical
-triplets across cooking / sports / technology — enough to demonstrate
-measurable recall lift in <1 minute of CPU training. Bring your own
-``Triplet`` list for real domains.
+triplets across cooking / sports / technology, small enough to train on
+CPU. Bring your own ``Triplet`` list for real domains.
 """
 
 from __future__ import annotations
@@ -95,51 +94,57 @@ _TOPICS: dict[str, list[tuple[str, str]]] = {
 }
 
 
-def synthetic_triplets(*, n_train: int = 800, n_eval: int = 200, seed: int = 7) -> tuple[list[Triplet], list[Triplet]]:
+def _build_triplets(
+    pairs_by_topic: dict[str, list[tuple[str, str]]], rng: random.Random, *, cross: bool
+) -> list[Triplet]:
+    topics = list(pairs_by_topic)
+    triplets: list[Triplet] = []
+    for topic, pairs in pairs_by_topic.items():
+        other_topics = [t for t in topics if t != topic]
+        for i, (anchor, own_answer) in enumerate(pairs):
+            positives = [own_answer]
+            if cross:
+                positives += [answer for j, (_, answer) in enumerate(pairs) if j != i]
+            for positive in positives:
+                negative = rng.choice(pairs_by_topic[rng.choice(other_topics)])[1]
+                triplets.append(Triplet(anchor=anchor, positive=positive, negative=negative, topic=topic))
+    rng.shuffle(triplets)
+    return triplets
+
+
+def synthetic_triplets(
+    *,
+    n_train: int = 800,
+    n_eval: int = 200,
+    seed: int = 7,
+    n_folds: int = 4,
+    fold: int = 0,
+) -> tuple[list[Triplet], list[Triplet]]:
     """Build train + eval triplets from the built-in topic corpus.
 
-    Each triplet's anchor + positive come from the same topic; the negative
-    is sampled from a different topic. Same-topic anchors share semantics
-    but use different phrasing so the projection head must learn topical
-    grouping, not surface tokens.
+    The (question, answer) pairs are split *before* any triplet is built.
+    Within each topic the pairs are shuffled and dealt into ``n_folds`` folds,
+    and fold ``fold`` is held out. With the same ``seed``, ``fold=0`` through
+    ``n_folds - 1`` hold out every pair exactly once (k-fold cross-validation).
+
+    Train triplets use training pairs only: each question with its own answer,
+    plus every other same-topic training answer as a noisier positive that
+    grows the set. Eval triplets are the held-out questions with their own
+    answers. Negatives are answers from a different topic in the same split,
+    so no text appears in both splits. ``n_train`` and ``n_eval`` cap the
+    returned lists.
     """
+    if n_folds < 2 or not 0 <= fold < n_folds:
+        raise ValueError(f"need n_folds >= 2 and 0 <= fold < n_folds, got {n_folds=}, {fold=}")
     rng = random.Random(seed)
-    all_topics = list(_TOPICS.keys())
-    by_topic: dict[str, list[tuple[str, str]]] = {t: list(_TOPICS[t]) for t in all_topics}
+    train_pairs: dict[str, list[tuple[str, str]]] = {}
+    eval_pairs: dict[str, list[tuple[str, str]]] = {}
+    for topic, pairs in _TOPICS.items():
+        shuffled = list(pairs)
+        rng.shuffle(shuffled)
+        eval_pairs[topic] = shuffled[fold::n_folds]
+        train_pairs[topic] = [p for i, p in enumerate(shuffled) if i % n_folds != fold]
 
-    triplets: list[Triplet] = []
-    for topic in all_topics:
-        items = by_topic[topic]
-        for i in range(len(items)):
-            anchor, positive = items[i]
-            negative_topic = rng.choice([t for t in all_topics if t != topic])
-            negative = rng.choice(by_topic[negative_topic])[1]
-            triplets.append(Triplet(anchor=anchor, positive=positive, negative=negative, topic=topic))
-
-    # Also build cross-anchor triplets to enlarge the set: use one topic's answer
-    # as another item's anchor by swapping. (Duplicates of the topic structure
-    # but different phrasing pairs.)
-    extra: list[Triplet] = []
-    for topic in all_topics:
-        items = by_topic[topic]
-        for i in range(len(items)):
-            for j in range(len(items)):
-                if i == j:
-                    continue
-                # Use item i's question as anchor, item j's answer as a *related* positive
-                # (same topic). This is a noisier positive but it grows the set.
-                anchor_q, _ = items[i]
-                _, pos_a = items[j]
-                neg_topic = rng.choice([t for t in all_topics if t != topic])
-                neg_a = rng.choice(by_topic[neg_topic])[1]
-                extra.append(Triplet(anchor=anchor_q, positive=pos_a, negative=neg_a, topic=topic))
-
-    rng.shuffle(extra)
-    full = triplets + extra
-    rng.shuffle(full)
-
-    if n_train + n_eval > len(full):
-        # Cap both at half the corpus.
-        n_train = len(full) // 2
-        n_eval = len(full) - n_train
-    return full[:n_train], full[n_train : n_train + n_eval]
+    train = _build_triplets(train_pairs, rng, cross=True)
+    held_out = _build_triplets(eval_pairs, rng, cross=False)
+    return train[:n_train], held_out[:n_eval]
